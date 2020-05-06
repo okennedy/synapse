@@ -45,10 +45,90 @@ from synapse.metrics.background_process_metrics import run_as_background_process
 from synapse.module_api import ModuleApi
 from synapse.push.mailer import load_jinja2_templates
 from synapse.types import Requester, UserID
+from synapse.util.msisdn import phone_number_to_msisdn
 
 from ._base import BaseHandler
 
 logger = logging.getLogger(__name__)
+
+
+def client_dict_convert_legacy_fields_to_identifier(
+    submission: Dict[str, Union[str, Dict]]
+):
+    """Take a legacy-formatted login submission or User-Interactive Authentication dict and
+    updates it to feature an identifier dict instead.
+
+    Providing user-identifying information at the top-level of a login or UIA submission is
+    now deprecated and replaced with identifiers:
+    https://matrix.org/docs/spec/client_server/r0.6.1#identifier-types
+
+    Args:
+        submission: The client dict to convert. Passed by reference and modified
+
+    Raises:
+        SynapseError: if the dict contains a "medium" parameter that is anything other than
+            "email"
+    """
+    if "user" in submission:
+        submission["identifier"] = {"type": "m.id.user", "user": submission["user"]}
+        del submission["user"]
+
+    if "medium" in submission and "address" in submission:
+        # "email" is the only accepted medium type
+        # TODO: This doesn't break UIA does it? Should this check be login-specific
+        if submission["medium"] != "email":
+            raise SynapseError(
+                400, "'medium' parameter must be 'email'", errcode=Codes.INVALID_PARAM
+            )
+
+        submission["identifier"] = {
+            "type": "m.id.thirdparty",
+            "medium": submission["medium"],
+            "address": submission["address"],
+        }
+        del submission["medium"]
+        del submission["address"]
+
+    # We've converted valid, legacy login submissions to an identifier. If the
+    # dict still doesn't have an identifier, it's invalid
+    if "identifier" not in submission:
+        raise SynapseError(
+            400,
+            "Missing 'identifier' parameter in login submission",
+            errcode=Codes.MISSING_PARAM,
+        )
+
+    # Ensure the identifier has a type
+    if "type" not in submission["identifier"]:
+        raise SynapseError(
+            400, "'identifier' dict has no key 'type'", errcode=Codes.MISSING_PARAM,
+        )
+
+
+def login_id_phone_to_thirdparty(identifier: Dict[str, str]):
+    """Convert a phone login identifier type to a generic threepid identifier. Modifies
+    the identifier dict in place
+
+    Args:
+        identifier: Login identifier dict of type 'm.id.phone'
+    """
+    if "type" not in identifier:
+        raise
+    if "country" not in identifier or "number" not in identifier:
+        raise SynapseError(
+            400, "Invalid phone-type identifier", errcode=Codes.INVALID_PARAM,
+        )
+
+    # Convert user-provided phone number to a consistent representation
+    msisdn = phone_number_to_msisdn(identifier["country"], identifier["number"])
+
+    # Modify the passed dictionary by reference
+    del identifier["country"]
+    del identifier["number"]
+
+    identifier["type"] = "m.id.thirdparty"
+    identifier["medium"] = "msisdn"
+    identifier["address"] = msisdn
 
 
 class AuthHandler(BaseHandler):
@@ -315,7 +395,7 @@ class AuthHandler(BaseHandler):
             # otherwise use whatever was last provided.
             #
             # This was designed to allow the client to omit the parameters
-            # and just supply the session in subsequent calls so it split
+            # and just supply the session in subsequent calls. So it splits
             # auth between devices by just sharing the session, (eg. so you
             # could continue registration from your phone having clicked the
             # email auth link on there). It's probably too open to abuse
@@ -512,15 +592,130 @@ class AuthHandler(BaseHandler):
             res = await checker.check_auth(authdict, clientip=clientip)
             return res
 
-        # build a v1-login-style dict out of the authdict and fall back to the
-        # v1 code
-        user_id = authdict.get("user")
+        # We don't have a checker for the auth type provided by the client
+        # Assume that it is `m.login.password`.
+        if login_type != LoginType.PASSWORD:
+            raise SynapseError(
+                400, "Unknown authentication type", errcode=Codes.INVALID_PARAM,
+            )
 
-        if user_id is None:
-            raise SynapseError(400, "", Codes.MISSING_PARAM)
+        password = authdict.get("password")
+        if password is None:
+            raise SynapseError(
+                400,
+                "Missing parameter for m.login.password dict: 'password'",
+                # We use INVALID_PARAM here as this parameter is not missing at the
+                # top-level dictionary
+                # XXX: Is this standard practice in Synapse?
+                errcode=Codes.INVALID_PARAM,
+            )
 
-        (canonical_id, callback) = await self.validate_login(user_id, authdict)
+        # Retrieve the user ID using details provided in the authdict
+
+        # Deprecation notice: Clients used to be able to simply provide a
+        # `user` field which pointed to a user_id or localpart. This has
+        # been deprecated in favour of an `identifier` key, which is a
+        # dictionary providing information on how to identify a single
+        # user.
+        # https://matrix.org/docs/spec/client_server/r0.6.1#identifier-types
+        #
+        # We convert old-style dicts to new ones here
+        client_dict_convert_legacy_fields_to_identifier(authdict)
+
+        # Extract a user ID from the values in the identifier
+        username = await self.username_from_identifier(authdict["identifier"],)
+
+        if username is None:
+            raise SynapseError(400, "Valid username not found")
+
+        # Now that we've found the username, validate that the password is correct
+        canonical_id, _ = await self.validate_login(username, authdict)
+
         return canonical_id
+
+    async def username_from_identifier(
+        self, identifier: Dict[str, str]
+    ) -> Optional[str]:
+        """Given a dictionary containing an identifier from a client, extract the
+        possibly unqualified username of the user that it identifies. Does *not*
+        guarantee that the user exists.
+
+        If this identifier dict contains a threepid, we attempt to ask password
+        auth providers about it or, failing that, look up an associated user in
+        the database.
+
+        Args:
+            identifier: The identifier dictionary provided by the client
+
+        Returns:
+            A username if one was found, or None otherwise
+
+        Raises:
+            SynapseError: If the identifier dict is invalid
+        """
+
+        # Convert phone type identifiers to generic threepid identifiers, which
+        # will be handled in the next step
+        if identifier["type"] == "m.id.phone":
+            login_id_phone_to_thirdparty(identifier)
+
+        # Convert a threepid identifier to an user identifier
+        if identifier["type"] == "m.id.thirdparty":
+            address = identifier.get("address")
+            medium = identifier.get("medium")
+
+            if not medium or not address:
+                # An error would've already been raised in
+                # `login_id_thirdparty_from_phone` if the original submission
+                # was a phone identifier
+                raise SynapseError(
+                    400, "Invalid thirdparty identifier", errcode=Codes.INVALID_PARAM,
+                )
+
+            if medium == "email":
+                # For emails, transform the address to lowercase.
+                # We store all email addresses as lowercase in the DB.
+                # (See add_threepid in synapse/handlers/auth.py)
+                address = address.lower()
+
+            # Check for auth providers that support 3pid login types
+            canonical_user_id, _ = await self.check_password_provider_3pid(
+                medium,
+                address,
+                identifier["password"],  # TODO: Wait, we don't have a password...
+            )
+            if canonical_user_id:
+                # Authentication through password provider and 3pid succeeded
+                return canonical_user_id
+
+            # Check local store
+            user_id = await self.hs.get_datastore().get_user_id_by_threepid(
+                medium, address
+            )
+            if not user_id:
+                # We were unable to find a user_id that belonged to the threepid returned
+                # by the password auth provider
+                return None
+
+            identifier = {"type": "m.id.user", "user": user_id}
+
+        # By this point, the identifier should be a `m.id.user`: if it's anything
+        # else, we haven't understood it.
+        if identifier["type"] != "m.id.user":
+            raise SynapseError(
+                400, "Unknown login identifier type", errcode=Codes.INVALID_PARAM,
+            )
+
+        # User identifiers have a "user" key
+        user = identifier.get("user")
+        if user is None:
+            raise SynapseError(
+                400,
+                "User identifier is missing 'user' key",
+                errcode=Codes.INVALID_PARAM,
+            )
+
+        return user
 
     def _get_params_recaptcha(self) -> dict:
         return {"public_key": self.hs.config.recaptcha_public_key}
@@ -686,7 +881,8 @@ class AuthHandler(BaseHandler):
         m.login.password auth types.
 
         Args:
-            username: username supplied by the user
+            username: a localpart or fully qualified user ID - what is provided by the
+                client
             login_submission: the whole of the login submission
                 (including 'type' and other relevant fields)
         Returns:
@@ -697,11 +893,10 @@ class AuthHandler(BaseHandler):
             SynapseError if there was a problem with the request
             LoginError if there was an authentication problem.
         """
-
-        if username.startswith("@"):
-            qualified_user_id = username
-        else:
-            qualified_user_id = UserID(username, self.hs.hostname).to_string()
+        # We need a fully qualified User ID for some method calls here
+        qualified_user_id = username
+        if not qualified_user_id.startswith("@"):
+            qualified_user_id = UserID(qualified_user_id, self.hs.hostname).to_string()
 
         login_type = login_submission.get("type")
         known_login_type = False
