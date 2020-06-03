@@ -313,12 +313,12 @@ class RegisterRestServletTestCase(unittest.HomeserverTestCase):
             "account_threepid_delegates": {
                 "email": "https://id_server",
                 "msisdn": "https://id_server",
-                "registration_only": True,
+                "adding_account_threepid_only": True,
             },
             "public_baseurl": "https://test_server",
         }
     )
-    def test_threepid_delegate_registration_only(self):
+    def test_threepid_delegate_adding_only(self):
         email = "kermit@example.com"
 
         user_id = self.register_user("kermit", "monkey")

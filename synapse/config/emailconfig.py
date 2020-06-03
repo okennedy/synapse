@@ -154,7 +154,7 @@ class EmailConfig(Config):
 
         if (
             self.threepid_behaviour_email == ThreepidBehaviour.LOCAL
-            or self.only_delegate_threepid_registration
+            or self.only_delegate_adding_threepid
         ):
             # If delegation is only configured for registration, we still have to handle
             # password resets, so we still need password reset templates.

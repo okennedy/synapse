@@ -48,7 +48,7 @@ class EmailPasswordRequestTokenRestServlet(RestServlet):
         self.config = hs.config
         self.identity_handler = hs.get_handlers().identity_handler
 
-        self.only_delegate_registration = hs.config.only_delegate_threepid_registration
+        self.only_delegate_registration = hs.config.only_delegate_adding_threepid
 
         if (
             self.config.threepid_behaviour_email == ThreepidBehaviour.LOCAL
@@ -162,7 +162,7 @@ class PasswordResetSubmitTokenServlet(RestServlet):
         self.store = hs.get_datastore()
         if (
             self.config.threepid_behaviour_email == ThreepidBehaviour.LOCAL
-            or self.config.only_delegate_threepid_registration
+            or self.config.only_delegate_adding_threepid
         ):
             (self.failure_email_template,) = load_jinja2_templates(
                 self.config.email_template_dir,
