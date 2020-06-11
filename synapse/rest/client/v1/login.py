@@ -156,7 +156,7 @@ class LoginRestServlet(RestServlet):
 
         # Extract a localpart or user ID from the values in the identifier
         username = await self.auth_handler.username_from_identifier(
-            login_submission["identifier"],
+            login_submission["identifier"], login_submission.get("password")
         )
 
         if not username:

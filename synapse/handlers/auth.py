@@ -623,7 +623,7 @@ class AuthHandler(BaseHandler):
         client_dict_convert_legacy_fields_to_identifier(authdict)
 
         # Extract a user ID from the values in the identifier
-        username = await self.username_from_identifier(authdict["identifier"],)
+        username = await self.username_from_identifier(authdict["identifier"], password)
 
         if username is None:
             raise SynapseError(400, "Valid username not found")
@@ -634,7 +634,7 @@ class AuthHandler(BaseHandler):
         return canonical_id
 
     async def username_from_identifier(
-        self, identifier: Dict[str, str]
+        self, identifier: Dict[str, str], password: Optional[str] = None
     ) -> Optional[str]:
         """Given a dictionary containing an identifier from a client, extract the
         possibly unqualified username of the user that it identifies. Does *not*
@@ -646,6 +646,8 @@ class AuthHandler(BaseHandler):
 
         Args:
             identifier: The identifier dictionary provided by the client
+            password: The user provided password if one exists. Used for asking
+                password auth providers for usernames from 3pid+password combos.
 
         Returns:
             A username if one was found, or None otherwise
@@ -679,14 +681,15 @@ class AuthHandler(BaseHandler):
                 address = address.lower()
 
             # Check for auth providers that support 3pid login types
-            canonical_user_id, _ = await self.check_password_provider_3pid(
-                medium,
-                address,
-                identifier["password"],  # TODO: Wait, we don't have a password...
-            )
-            if canonical_user_id:
-                # Authentication through password provider and 3pid succeeded
-                return canonical_user_id
+            if password is not None:
+                canonical_user_id, _ = await self.check_password_provider_3pid(
+                    medium,
+                    address,
+                    password,
+                )
+                if canonical_user_id:
+                    # Authentication through password provider and 3pid succeeded
+                    return canonical_user_id
 
             # Check local store
             user_id = await self.hs.get_datastore().get_user_id_by_threepid(
