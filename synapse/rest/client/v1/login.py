@@ -111,7 +111,8 @@ class LoginRestServlet(RestServlet):
                 result = await self.do_token_login(login_submission)
             else:
                 result = await self._do_other_login(login_submission)
-        except KeyError:
+        except KeyError as e:
+            logger.debug("KeyError during login: %s", e)
             raise SynapseError(400, "Missing JSON keys.")
 
         well_known_data = self._well_known_builder.get_well_known()
